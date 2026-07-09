@@ -1,0 +1,23 @@
+#version 450
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+layout(set = 0, binding = 3) readonly buffer Bias { float bias[]; };
+layout(push_constant) uniform PC { int M; int K; int has_bias; int expert_idx; int M_per_expert; } pc;
+
+void main() {
+    int m = int(gl_GlobalInvocationID.x);
+    if (m >= pc.M) return;
+    
+    float sum = 0.0;
+    int expert_off = pc.expert_idx * pc.M_per_expert * pc.K;
+    int row_offset = expert_off + m * pc.K;
+    
+    for (int k = 0; k < pc.K; k++) {
+        sum += a[row_offset + k] * b[k];
+    }
+    
+    if (pc.has_bias == 1) sum += bias[pc.expert_idx * pc.M_per_expert + m];
+    c[m] = sum;
+}

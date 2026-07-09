@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer Gate { float gate[]; };
+layout(set = 0, binding = 1) readonly buffer Up { float up[]; };
+layout(push_constant) uniform PC { int n_ff; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n_ff) {
+        float x_glu = min(gate[i], 7.0f);
+        float x_lin = max(-7.0f, min(up[i], 7.0f));
+        float out_glu = x_glu / (1.0f + exp(-1.702f * x_glu));
+        gate[i] = out_glu * (x_lin + 1.0f);
+    }
+}

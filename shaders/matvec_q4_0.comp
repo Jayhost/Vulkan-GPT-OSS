@@ -1,0 +1,36 @@
+#version 450
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+layout(set = 0, binding = 3) readonly buffer Bias { float bias[]; };
+layout(push_constant) uniform PC { int M; int K; int has_bias; } pc;
+
+void main() {
+    uint m = gl_GlobalInvocationID.x;
+    if (m >= uint(pc.M)) return;
+    
+    float sum = 0.0;
+    int nblk = pc.K / 32;
+    int row_offset = int(m) * nblk * 18;
+    
+    for (int blk = 0; blk < nblk; blk++) {
+        int byte_off = row_offset + blk * 18;
+        uint word0 = a[byte_off / 4];
+        uint d_raw = (word0 >> ((byte_off % 4) * 8)) & 0xFFFF;
+        float d = unpackHalf2x16(d_raw).x;
+        
+        for (int i = 0; i < 16; i++) {
+            int q_byte_off = byte_off + 2 + i;
+            uint word1 = a[q_byte_off / 4];
+            uint q_val = (word1 >> ((q_byte_off % 4) * 8)) & 0xFF;
+            
+            int q0 = int(q_val & 0x0F) - 8;
+            int q1 = int(q_val >> 4) - 8;
+            sum += d * float(q0) * b[blk * 32 + i];
+            sum += d * float(q1) * b[blk * 32 + i + 16];
+        }
+    }
+    if (pc.has_bias == 1) sum += bias[m];
+    c[m] = sum;
+}   

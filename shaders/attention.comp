@@ -1,0 +1,65 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { float k[]; };
+layout(set = 0, binding = 2) readonly buffer V { float v[]; };
+layout(set = 0, binding = 3) readonly buffer Sinks { float sinks[]; };
+layout(set = 0, binding = 4) writeonly buffer OutBuf { float out_data[]; };
+layout(push_constant) uniform PC {
+    int n_head; int n_head_kv; int head_dim; int pos;
+    int sliding_window; int layer_idx; float scale; float attn_cap;
+} pc;
+
+void main() {
+    int hh = int(gl_GlobalInvocationID.x);
+    if (hh >= pc.n_head) return;
+    
+    int kvh = hh * pc.n_head_kv / pc.n_head;
+    int hd = pc.head_dim;
+    
+    int start = 0;
+    bool is_sliding = (pc.sliding_window > 0) && (pc.layer_idx % 2 == 0);
+    if (is_sliding) start = max(0, pc.pos - pc.sliding_window + 1);
+    
+    int q_off = hh * hd;
+    int kv_step = pc.n_head_kv * hd;
+    
+    // Pass 1: Find max
+    float mx = -1e30f;
+    for (int p2 = start; p2 <= pc.pos; p2++) {
+        int k_off = p2 * kv_step + kvh * hd;
+        float dot = 0.0;
+        for (int d = 0; d < hd; d++) dot += q[q_off + d] * k[k_off + d];
+        dot *= pc.scale;
+        if (pc.attn_cap > 0.0f) dot = tanh(dot / pc.attn_cap) * pc.attn_cap;
+        mx = max(mx, dot);
+    }
+    float sink_val = sinks[hh];
+    mx = max(mx, sink_val);
+    
+    // Pass 2: Sum exp
+    float sum = 0.0;
+    for (int p2 = start; p2 <= pc.pos; p2++) {
+        int k_off = p2 * kv_step + kvh * hd;
+        float dot = 0.0;
+        for (int d = 0; d < hd; d++) dot += q[q_off + d] * k[k_off + d];
+        dot *= pc.scale;
+        if (pc.attn_cap > 0.0f) dot = tanh(dot / pc.attn_cap) * pc.attn_cap;
+        sum += exp(dot - mx);
+    }
+    sum += exp(sink_val - mx);
+    
+    // Pass 3: Accumulate V
+    for (int d = 0; d < hd; d++) out_data[q_off + d] = 0.0;
+    for (int p2 = start; p2 <= pc.pos; p2++) {
+        int k_off = p2 * kv_step + kvh * hd;
+        float dot = 0.0;
+        for (int d = 0; d < hd; d++) dot += q[q_off + d] * k[k_off + d];
+        dot *= pc.scale;
+        if (pc.attn_cap > 0.0f) dot = tanh(dot / pc.attn_cap) * pc.attn_cap;
+        float w = exp(dot - mx) / sum;
+        
+        int v_off = p2 * kv_step + kvh * hd;
+        for (int d = 0; d < hd; d++) out_data[q_off + d] += w * v[v_off + d];
+    }
+}

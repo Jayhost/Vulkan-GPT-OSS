@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) readonly buffer Src { float src[]; };
+layout(set = 0, binding = 1) buffer Dst { float dst[]; };
+layout(push_constant) uniform PC { int pos; int n_head_kv; int head_dim; } pc;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    int total = pc.n_head_kv * pc.head_dim;
+    if (tid >= total) return;
+    
+    // KV cache layout: [seq_len, n_head_kv, head_dim]
+    int offset = pc.pos * total + int(tid);
+    dst[offset] = src[tid];
+}
