@@ -1,0 +1,39 @@
+#version 450
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) writeonly buffer C { float c[]; };
+layout(set = 0, binding = 3) readonly buffer Bias { float bias[]; };
+layout(push_constant) uniform PC { int M; int K; int has_bias; } pc;
+
+shared float s_sums[32];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.x;
+    if (m >= uint(pc.M)) return;
+    
+    float sum = 0.0;
+    int row_offset = int(m) * pc.K;
+    
+    // Read 2 F16 values per iteration (4 bytes per uint) for perfectly coalesced reads
+    for (int k = int(tid) * 2; k < pc.K; k += 32 * 2) {
+        int word_off = (row_offset + k) / 2;
+        uint w = a[word_off];
+        vec2 v = unpackHalf2x16(w);
+        sum += v.x * b[k] + v.y * b[k + 1];
+    }
+    
+    s_sums[tid] = sum;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) s_sums[tid] += s_sums[tid + s];
+        barrier();
+    }
+    
+    if (tid == 0) {
+        float final_sum = s_sums[0];
+        if (pc.has_bias == 1) final_sum += bias[m];
+        c[m] = final_sum;
+    }
+}

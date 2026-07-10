@@ -1,0 +1,35 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+layout(push_constant) uniform PC { int n; float eps; } pc;
+
+shared float s_sums[256];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    // Each thread computes the sum of squares for all elements it owns
+    float local_sum = 0.0;
+    for (uint i = gid; i < pc.n; i += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
+        float val = x[i];
+        local_sum += val * val;
+    }
+    s_sums[tid] = local_sum;
+    barrier();
+
+    // Reduction within the (only) workgroup
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_sums[tid] += s_sums[tid + s];
+        barrier();
+    }
+
+    float rms = 1.0 / sqrt(s_sums[0] / float(pc.n) + pc.eps);
+
+    // Apply normalisation to all elements assigned to this thread
+    for (uint i = gid; i < pc.n; i += gl_WorkGroupSize.x * gl_NumWorkGroups.x) {
+        y[i] = x[i] * rms * w[i];
+    }
+}

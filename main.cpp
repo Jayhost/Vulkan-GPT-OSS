@@ -9,6 +9,14 @@
 #include <algorithm>
 #include <fstream>
 #include <vector>
+#include <random>  
+
+// Returns a uniform random float in [0, 1)
+inline float rng_next() {
+    static thread_local std::mt19937       rng{ std::random_device{}() };
+    static thread_local std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    return dist(rng);
+}
 
 struct SamplerArgs {
     float temp = 1.0f;
@@ -33,7 +41,9 @@ int sample(float* logits, int vocab_size, const SamplerArgs& sa,
     }
 
     if (sa.top_k > 0 && sa.top_k < vocab_size) {
-        std::vector<float> tmp(logits, logits + vocab_size);
+        static std::vector<float> tmp;
+        if ((int)tmp.size() != vocab_size) tmp.resize(vocab_size);
+        memcpy(tmp.data(), logits, vocab_size * 4);
         std::nth_element(tmp.begin(), tmp.begin() + vocab_size - sa.top_k, tmp.end());
         float threshold = tmp[vocab_size - sa.top_k];
         for (int i = 0; i < vocab_size; i++)
@@ -42,16 +52,21 @@ int sample(float* logits, int vocab_size, const SamplerArgs& sa,
 
     float mx = logits[0];
     for (int i = 1; i < vocab_size; i++) mx = std::max(mx, logits[i]);
+    
     float sum = 0;
-    std::vector<float> probs(vocab_size);
+    static std::vector<float> probs;
+    if ((int)probs.size() != vocab_size) probs.resize(vocab_size);
+
     for (int i = 0; i < vocab_size; i++) {
         probs[i] = expf(logits[i] - mx);
         sum += probs[i];
     }
-    for (int i = 0; i < vocab_size; i++) probs[i] /= sum;
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < vocab_size; i++) probs[i] *= inv_sum;
 
     if (sa.top_p < 1.0f) {
-        std::vector<int> idx(vocab_size);
+        static std::vector<int> idx;
+        if ((int)idx.size() != vocab_size) idx.resize(vocab_size);
         for (int i = 0; i < vocab_size; i++) idx[i] = i;
         std::sort(idx.begin(), idx.end(), [&](int a, int b){ return probs[a] > probs[b]; });
         float cumsum = 0;
@@ -64,7 +79,8 @@ int sample(float* logits, int vocab_size, const SamplerArgs& sa,
         }
         sum = 0;
         for (int i = 0; i < vocab_size; i++) sum += probs[i];
-        for (int i = 0; i < vocab_size; i++) probs[i] /= sum;
+        inv_sum = 1.0f / sum;
+        for (int i = 0; i < vocab_size; i++) probs[i] *= inv_sum;
     }
 
     float r = rng_val;
@@ -74,14 +90,6 @@ int sample(float* logits, int vocab_size, const SamplerArgs& sa,
         if (r <= acc) return i;
     }
     return vocab_size - 1;
-}
-
-uint64_t rng_state = 12345;
-float rng_next() {
-    rng_state ^= rng_state << 13;
-    rng_state ^= rng_state >> 7;
-    rng_state ^= rng_state << 17;
-    return (float)((rng_state >> 11) & 0xFFFFFF) / (float)0x1000000;
 }
 
 int main(int argc, char** argv) {
@@ -143,6 +151,7 @@ int main(int argc, char** argv) {
     infer.add_moe_shader = loadShader("shaders/add_moe.spv");
     infer.embed_lookup_shader = loadShader("shaders/embed_lookup.spv");
     infer.tanh_cap_shader     = loadShader("shaders/tanh_cap.spv");
+    infer.reduce_moe_shader = loadShader("shaders/reduce_moe.spv"); 
 
     infer.init(&model, &vk);
 
@@ -181,16 +190,21 @@ int main(int argc, char** argv) {
     // Sample first generated token immediately from prefill output
     int next = sample(logits.data(), model.cfg.vocab_size, sa, recent, rng_next());
 
-    // --- Generation Loop ---
+        // --- Generation Loop ---
     for (int i = 0; i < max_tokens; i++) {
         if (next == model.cfg.eos_id) {
             printf("<EOS>\n");
             break;
         }
 
+        auto cpu_start = std::chrono::steady_clock::now();
+        
         // 1. Submit forward pass for the token. GPU starts working immediately.
         infer.forward(next, pos);
         pos++;
+
+        auto cpu_end = std::chrono::steady_clock::now();
+        double cpu_ms = std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count();
 
         // 2. Overlap CPU side string decode/print with GPU execution
         std::string piece = tok.decode({next});
@@ -202,7 +216,16 @@ int main(int argc, char** argv) {
         if (recent.size() > 64) recent.erase(recent.begin());
 
         // 3. Block only now that we actually need the logits to sample the next token
+        auto gpu_wait_start = std::chrono::steady_clock::now();
         infer.get_logits(logits.data());
+        auto gpu_wait_end = std::chrono::steady_clock::now();
+        double gpu_wait_ms = std::chrono::duration<double, std::milli>(gpu_wait_end - gpu_wait_start).count();
+
+        // Print timing for the first 5 tokens to see the split
+        // if (i < 5) {
+        //     printf("\n[Token %d] CPU build: %.2f ms | GPU wait: %.2f ms\n", i, cpu_ms, gpu_wait_ms);
+        // }
+
         next = sample(logits.data(), model.cfg.vocab_size, sa, recent, rng_next());
     }
     printf("\n");
@@ -229,6 +252,7 @@ int main(int argc, char** argv) {
     vk.destroyShader(infer.add_moe_shader);
     vk.destroyShader(infer.embed_lookup_shader);
 vk.destroyShader(infer.tanh_cap_shader);
+vk.destroyShader(infer.reduce_moe_shader); 
 
     vk.cleanup();
     return 0;

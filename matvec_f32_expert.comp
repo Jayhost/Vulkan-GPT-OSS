@@ -1,0 +1,48 @@
+#version 450
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+layout(set = 0, binding = 3) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 4) readonly buffer MoeW { float moe_w[]; };
+layout(set = 0, binding = 5) readonly buffer TopkIdx { int topk_idx[]; };
+layout(push_constant) uniform PC { int M; int K; int has_bias; int M_per_expert; int accumulate; } pc;
+
+shared float s_sums[32];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.x;
+    uint slot = gl_WorkGroupID.y;
+    if (m >= uint(pc.M)) return;
+    
+    int expert_idx = topk_idx[slot]; // Read expert index dynamically
+    
+    float sum = 0.0;
+    int expert_off = expert_idx * pc.M_per_expert * pc.K;
+    int row_offset = expert_off + int(m) * pc.K;
+    
+    // Down projection (accumulate=1) reads from per-slot FFN output. Gate/Up read shared normed_buf.
+    int b_off = (pc.accumulate == 1) ? int(slot) * pc.K : 0;
+    for (int k = int(tid); k < pc.K; k += 32) {
+        sum += a[row_offset + k] * b[b_off + k];
+    }
+    
+    s_sums[tid] = sum;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) s_sums[tid] += s_sums[tid + s];
+        barrier();
+    }
+    
+    if (tid == 0) {
+        float final_sum = s_sums[0];
+        if (pc.has_bias == 1) final_sum += bias[expert_idx * pc.M_per_expert + int(m)];
+        
+        uint out_idx = slot * pc.M + uint(m);
+        if (pc.accumulate == 1) {
+            final_sum *= moe_w[expert_idx]; // ONLY apply MoE weight on Down projection
+        }
+        c[out_idx] = final_sum;
+    }
+}

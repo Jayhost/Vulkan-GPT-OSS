@@ -1,0 +1,25 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer Cos { float cos_t[]; };
+layout(set = 0, binding = 2) readonly buffer Sin { float sin_t[]; };
+layout(push_constant) uniform PC { int n_head; int head_dim; int pos; } pc;
+
+void main() {
+    uint h = gl_GlobalInvocationID.x;
+    if (h >= uint(pc.n_head)) return;
+    
+    int half_dim = pc.head_dim / 2;
+    int base = int(h) * pc.head_dim;
+    int tbl_off = pc.pos * half_dim;
+    
+    for (int i = 0; i < half_dim; i++) {
+        float x1 = x[base + i];
+        float x2 = x[base + i + half_dim];
+        float c = cos_t[tbl_off + i];
+        float s = sin_t[tbl_off + i];
+        
+        x[base + i]            = x1 * c - x2 * s;
+        x[base + i + half_dim] = x2 * c + x1 * s;
+    }
+}

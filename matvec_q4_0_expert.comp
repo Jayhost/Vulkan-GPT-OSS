@@ -1,0 +1,93 @@
+#version 450
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) readonly buffer A { uint a[]; };
+layout(set = 0, binding = 1) readonly buffer B { float b[]; };
+layout(set = 0, binding = 2) buffer C { float c[]; };
+layout(set = 0, binding = 3) readonly buffer Bias { float bias[]; };
+layout(set = 0, binding = 4) readonly buffer MoeW { float moe_w[]; };
+layout(set = 0, binding = 5) readonly buffer TopkIdx { int topk_idx[]; };
+layout(push_constant) uniform PC { int M; int K; int has_bias; int M_per_expert; int accumulate; } pc;
+
+shared float s_sums[32];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint m = gl_WorkGroupID.x;
+    uint slot = gl_WorkGroupID.y;
+    if (m >= uint(pc.M)) return;
+    
+    int expert_idx = topk_idx[slot]; // Read expert index dynamically
+    
+    int nblk = pc.K / 32;
+    int expert_off = expert_idx * pc.M_per_expert * nblk * 18;
+    int row_offset = expert_off + int(m) * nblk * 18;
+    
+    int b_off = (pc.accumulate == 1) ? int(slot) * pc.K : 0;
+    float sum = 0.0;
+    for (int blk = int(tid); blk < nblk; blk += 32) {
+        int byte_off = row_offset + blk * 18;
+        int w0_off = byte_off / 4;
+        
+        uint words[5];
+        words[0] = a[w0_off];
+        words[1] = a[w0_off + 1];
+        words[2] = a[w0_off + 2];
+        words[3] = a[w0_off + 3];
+        words[4] = a[w0_off + 4];
+        
+        uint shift = (byte_off & 3) * 8;
+        uint d_raw = (words[0] >> shift) & 0xFFFF;
+        float d = unpackHalf2x16(d_raw).x;
+        
+        uint qs0 = (shift == 0) ? ((words[0] >> 16) | (words[1] << 16)) : words[1];
+        uint qs1 = (shift == 0) ? ((words[1] >> 16) | (words[2] << 16)) : words[2];
+        uint qs2 = (shift == 0) ? ((words[2] >> 16) | (words[3] << 16)) : words[3];
+        uint qs3 = (shift == 0) ? ((words[3] >> 16) | (words[4] << 16)) : words[4];
+        
+        uint qs_arr[4] = uint[](qs0, qs1, qs2, qs3);
+        for (int i = 0; i < 4; i++) {
+            uint q_val = qs_arr[i];
+            
+            int b0 = int(q_val & 0xFF);
+            int b1 = int((q_val >> 8) & 0xFF);
+            int b2 = int((q_val >> 16) & 0xFF);
+            int b3 = int((q_val >> 24) & 0xFF);
+            
+            int q0_0 = (b0 & 0x0F) - 8;
+            int q1_0 = (b0 >> 4) - 8;
+            int q0_1 = (b1 & 0x0F) - 8;
+            int q1_1 = (b1 >> 4) - 8;
+            int q0_2 = (b2 & 0x0F) - 8;
+            int q1_2 = (b2 >> 4) - 8;
+            int q0_3 = (b3 & 0x0F) - 8;
+            int q1_3 = (b3 >> 4) - 8;
+            
+            int base_k = blk * 32 + i * 4;
+            vec4 b_vec0 = vec4(b[b_off + base_k], b[b_off + base_k + 1], b[b_off + base_k + 2], b[b_off + base_k + 3]);
+            vec4 b_vec1 = vec4(b[b_off + base_k + 16], b[b_off + base_k + 17], b[b_off + base_k + 18], b[b_off + base_k + 19]);
+            
+            vec4 q0_vec = vec4(float(q0_0), float(q0_1), float(q0_2), float(q0_3)) * d;
+            vec4 q1_vec = vec4(float(q1_0), float(q1_1), float(q1_2), float(q1_3)) * d;
+            
+            sum += dot(q0_vec, b_vec0) + dot(q1_vec, b_vec1);
+        }
+    }
+    
+    s_sums[tid] = sum;
+    barrier();
+    for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) s_sums[tid] += s_sums[tid + s];
+        barrier();
+    }
+    
+    if (tid == 0) {
+        float final_sum = s_sums[0];
+        if (pc.has_bias == 1) final_sum += bias[expert_idx * pc.M_per_expert + int(m)];
+        
+        uint out_idx = slot * uint(pc.M) + m;
+        if (pc.accumulate == 1) {
+            final_sum *= moe_w[expert_idx]; // ONLY apply MoE weight on Down projection
+        }
+        c[out_idx] = final_sum;
+    }
+}

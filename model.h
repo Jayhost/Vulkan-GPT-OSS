@@ -6,7 +6,7 @@
 
 float fp16_to_fp32(uint16_t h);
 struct block_q4_0 { uint16_t d; uint8_t qs[16]; };
-
+    
 struct ModelConfig {
     std::string arch;
     int n_layers=0, n_ctx=0, n_embd=0, n_ff=0;
@@ -65,11 +65,10 @@ struct Inference {
     std::vector<float> cos_table, sin_table;
 
     VkBuffer h_buf, normed_buf, q_buf, k_buf, v_buf, attn_out_buf, tmp_buf, logits_buf;
-    VkBuffer gate_out_buf, up_out_buf, down_out_buf, router_buf;
+    VkBuffer gate_out_buf = VK_NULL_HANDLE, up_out_buf = VK_NULL_HANDLE, down_out_buf = VK_NULL_HANDLE, down_out_all_buf = VK_NULL_HANDLE, router_buf = VK_NULL_HANDLE;
+    VkBuffer moe_weights_buf = VK_NULL_HANDLE, topk_indices_buf = VK_NULL_HANDLE;
     VkBuffer token_embd_buf, output_norm_buf, output_buf;
     VkBuffer cos_buf, sin_buf;
-    VkShaderModule moe_router_shader, add_moe_shader;
-    VkBuffer moe_weights_buf;
     std::vector<VkBuffer> kv_k_buf, kv_v_buf;
 
     struct VulkanLayerTensors {
@@ -85,6 +84,7 @@ struct Inference {
     VkShaderModule matvec_f32_expert_shader, matvec_f16_expert_shader, matvec_q4_0_expert_shader;
     VkShaderModule rope_shader, copy_to_kv_shader, attention_shader, swiglu_shader, add_shader;
     VkShaderModule embed_lookup_shader, tanh_cap_shader;
+    VkShaderModule moe_router_shader, add_moe_shader, reduce_moe_shader;
 
     int readback_flip = 0; // Tracks double-buffered logits readback offset
 

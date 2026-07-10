@@ -198,17 +198,30 @@ void VulkanBackend::beginCommandBuffer() {
     stagingOffset_ = 0; // Safe to reset since GPU is idle
 }
 
-void VulkanBackend::barrier(const std::vector<VkBuffer>& bufs) {
+// FIXED: Only include transfer stages when explicitly requested
+void VulkanBackend::barrier(const std::vector<VkBuffer>& bufs, bool include_transfer) {
     if (bufs.empty()) return;
 
     std::vector<VkBufferMemoryBarrier> bmb;
     bmb.reserve(bufs.size());
+    
+    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkAccessFlags srcMask = VK_ACCESS_SHADER_WRITE_BIT;
+    VkAccessFlags dstMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    if (include_transfer) {
+        srcStage |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage |= VK_PIPELINE_STAGE_TRANSFER_BIT;
+        srcMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
+        dstMask |= VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+
     for (VkBuffer b : bufs) {
         if (b == VK_NULL_HANDLE) continue;
         VkBufferMemoryBarrier bar{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-        bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        bar.srcAccessMask = srcMask;
+        bar.dstAccessMask = dstMask;
         bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         bar.buffer = b;
@@ -219,8 +232,7 @@ void VulkanBackend::barrier(const std::vector<VkBuffer>& bufs) {
     if (bmb.empty()) return;
 
     vkCmdPipelineBarrier(commandBuffer_,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        srcStage, dstStage,
         0, 0, nullptr,
         (uint32_t)bmb.size(), bmb.data(),
         0, nullptr);
@@ -246,37 +258,49 @@ void VulkanBackend::dispatch(VkShaderModule shader, uint32_t groupX, uint32_t gr
         pipelineCache_[shader] = pipeline;
     }
 
-    VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    dsai.descriptorPool = descPool_;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &descSetLayout_;
+    // 1. Build the cache key
+    DescSetKey key;
+    key.shader = shader;
+    for (int i = 0; i < 8; i++) {
+        key.b[i] = (i < bindings.size() && bindings[i] != VK_NULL_HANDLE) ? bindings[i] : dummy_buf;
+    }
+
+    // 2. Find or create the descriptor set
     VkDescriptorSet descSet;
-    if (vkAllocateDescriptorSets(device_, &dsai, &descSet) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate descriptor set");
+    auto descIt = descSetCache_.find(key);
+    if (descIt != descSetCache_.end()) {
+        descSet = descIt->second;
+    } else {
+        VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        dsai.descriptorPool = descPool_;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &descSetLayout_;
+        if (vkAllocateDescriptorSets(device_, &dsai, &descSet) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate descriptor set");
+        }
+
+        VkDescriptorBufferInfo bufInfos[8];
+        VkWriteDescriptorSet writes[8];
+        for (size_t i = 0; i < 8; i++) {
+            bufInfos[i] = {key.b[i], 0, VK_WHOLE_SIZE};
+            writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[i].dstSet = descSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].descriptorCount = 1;
+            writes[i].pBufferInfo = &bufInfos[i];
+        }
+        vkUpdateDescriptorSets(device_, 8, writes, 0, nullptr);
+        descSetCache_[key] = descSet;
     }
 
-    VkDescriptorBufferInfo bufInfos[8];
-    VkWriteDescriptorSet writes[8];
-    for (size_t i = 0; i < 8; i++) {
-        VkBuffer buf = (i < bindings.size() && bindings[i] != VK_NULL_HANDLE) ? bindings[i] : dummy_buf;
-        bufInfos[i] = {buf, 0, VK_WHOLE_SIZE};
-        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        writes[i].dstSet = descSet;
-        writes[i].dstBinding = i;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].descriptorCount = 1;
-        writes[i].pBufferInfo = &bufInfos[i];
-    }
-    vkUpdateDescriptorSets(device_, 8, writes, 0, nullptr);
-
+    // 3. Dispatch
     vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet, 0, nullptr);
     if (pushConstData && pushConstSize > 0) {
         vkCmdPushConstants(commandBuffer_, pipelineLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstSize, pushConstData);
     }
     vkCmdDispatch(commandBuffer_, groupX, groupY, groupZ);
-
-    pendingDescSets_.push_back(descSet);
 }
 
 void VulkanBackend::endAndSubmitCommandBuffer() {
@@ -289,10 +313,9 @@ void VulkanBackend::endAndSubmitCommandBuffer() {
 
 void VulkanBackend::waitFence() {
     vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    // We no longer free descriptor sets per-frame, they are cached!
     for (auto p : pendingPipelines_) vkDestroyPipeline(device_, p, nullptr);
-    for (auto d : pendingDescSets_) vkFreeDescriptorSets(device_, descPool_, 1, &d);
     pendingPipelines_.clear();
-    pendingDescSets_.clear();
 }
 
 void VulkanBackend::waitIdle() {
