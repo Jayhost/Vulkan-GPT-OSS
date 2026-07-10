@@ -2,23 +2,7 @@
 #include "vulkan_backend.h"
 #include <cmath>
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
-
-// #define VK_DEBUG_DUMP 1
-
-#ifdef VK_DEBUG_DUMP
-#define DUMP_BUF(vk, buf, size, name) \
-    do { \
-        std::vector<float> _tmp(size); \
-        vk.copyFromBuffer(buf, _tmp.data(), size * 4); \
-        FILE* _f = fopen(name, "wb"); \
-        fwrite(_tmp.data(), sizeof(float), size, _f); \
-        fclose(_f); \
-    } while(0)
-#else
-#define DUMP_BUF(vk, buf, size, name)
-#endif
 
 float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
@@ -43,15 +27,15 @@ float fp16_to_fp32(uint16_t h) {
 
 VkBuffer uploadTensor(VulkanBackend& vk, const GGUFTensor* t) {
     if (!t) return VK_NULL_HANDLE;
-    // Allocate in actual VRAM (DEVICE_LOCAL) and upload via staging buffer
     VkBuffer buf = vk.createBuffer(t->nbytes(), 
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, 
                                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT); 
-    vk.uploadToDeviceLocal(buf, t->data, t->nbytes());
+    vk.uploadData(buf, t->data, t->nbytes());
     return buf;
 }
 
 void Model::load(GGUFFile& gf) {
+    // (Unchanged, omitted for brevity)
     auto* arch = gf.get("general.architecture");
     cfg.arch = arch ? arch->s : "gpt-oss";
     std::string p = cfg.arch + ".";
@@ -167,18 +151,6 @@ void Model::load(GGUFFile& gf) {
     }
 
     is_moe = (cfg.n_experts > 0);
-    
-    printf("Model: %s | layers=%d embd=%d ff=%d heads=%d kv=%d hd=%d",
-           cfg.arch.c_str(), cfg.n_layers, cfg.n_embd, cfg.n_ff,
-           cfg.n_head, cfg.n_head_kv, cfg.head_dim);
-    if (is_moe) printf(" experts=%d/%d", cfg.n_experts_per_tok, cfg.n_experts);
-    printf(" vocab=%d ctx=%d\n", cfg.vocab_size, cfg.n_ctx);
-    printf("  rope_base=%.0f sliding=%d\n", cfg.rope_freq_base, cfg.sliding_window);
-    
-    if (!layers.empty() && layers[0].q) {
-        printf("  Weight types: q=%u k=%u gate_exps=%u\n", 
-               layers[0].q->type, layers[0].k->type, layers[0].gate_exps ? layers[0].gate_exps->type : 0);
-    }
 }
 
 void Inference::init(Model* m, VulkanBackend* vk) {
@@ -186,29 +158,29 @@ void Inference::init(Model* m, VulkanBackend* vk) {
     vk_backend = vk;
     auto& cfg = m->cfg;
 
-    // Scratch buffers stay in Host Visible memory for fast CPU reads/writes per step
-    h_buf = vk_backend->createBuffer(cfg.n_embd * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    normed_buf = vk_backend->createBuffer(cfg.n_embd * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    q_buf = vk_backend->createBuffer(cfg.n_head * cfg.head_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    k_buf = vk_backend->createBuffer(cfg.n_head_kv * cfg.head_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    v_buf = vk_backend->createBuffer(cfg.n_head_kv * cfg.head_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    attn_out_buf = vk_backend->createBuffer(std::max(cfg.n_embd, cfg.n_head * cfg.head_dim) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    tmp_buf = vk_backend->createBuffer(std::max(cfg.n_embd, cfg.n_ff) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    logits_buf = vk_backend->createBuffer(cfg.vocab_size * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // All scratch buffers are strictly DEVICE_LOCAL now. No host visible mappings.
+    h_buf = vk_backend->createBuffer(cfg.n_embd * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    normed_buf = vk_backend->createBuffer(cfg.n_embd * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    q_buf = vk_backend->createBuffer(cfg.n_head * cfg.head_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    k_buf = vk_backend->createBuffer(cfg.n_head_kv * cfg.head_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    v_buf = vk_backend->createBuffer(cfg.n_head_kv * cfg.head_dim * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    attn_out_buf = vk_backend->createBuffer(std::max(cfg.n_embd, cfg.n_head * cfg.head_dim) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    tmp_buf = vk_backend->createBuffer(std::max(cfg.n_embd, cfg.n_ff) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    logits_buf = vk_backend->createBuffer(cfg.vocab_size * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-    gate_out_buf = vk_backend->createBuffer(cfg.n_ff * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    up_out_buf = vk_backend->createBuffer(cfg.n_ff * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    // Added VK_BUFFER_USAGE_TRANSFER_DST_BIT so we can use vkCmdFillBuffer on it
-    down_out_buf = vk_backend->createBuffer(cfg.n_embd * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    router_buf = vk_backend->createBuffer(cfg.n_experts * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    gate_out_buf = vk_backend->createBuffer(cfg.n_ff * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    up_out_buf = vk_backend->createBuffer(cfg.n_ff * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    down_out_buf = vk_backend->createBuffer(cfg.n_embd * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    router_buf = vk_backend->createBuffer(cfg.n_experts * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    moe_weights_buf = vk_backend->createBuffer(cfg.n_experts * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    // Batch all initial uploads via the ring buffer in a single command buffer
+    vk_backend->beginCommandBuffer();
 
     token_embd_buf = uploadTensor(*vk_backend, m->token_embd);
     output_norm_buf = uploadTensor(*vk_backend, m->output_norm);
     output_buf = uploadTensor(*vk_backend, m->output);
-
-    if (output_buf == VK_NULL_HANDLE) {
-        output_buf = token_embd_buf;
-    }
+    if (output_buf == VK_NULL_HANDLE) output_buf = token_embd_buf;
 
     vk_layers.resize(cfg.n_layers);
     for (int i = 0; i < cfg.n_layers; i++) {
@@ -238,17 +210,12 @@ void Inference::init(Model* m, VulkanBackend* vk) {
     kv_k_buf.resize(cfg.n_layers);
     kv_v_buf.resize(cfg.n_layers);
     size_t kv_size = (size_t)cfg.n_ctx * cfg.n_head_kv * cfg.head_dim * 4;
-    
-    // Zero out KV cache natively on GPU
-    vk_backend->beginCommandBuffer();
     for (int i = 0; i < cfg.n_layers; i++) {
         kv_k_buf[i] = vk_backend->createBuffer(kv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         kv_v_buf[i] = vk_backend->createBuffer(kv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         vk_backend->fillBuffer(kv_k_buf[i], kv_size, 0);
         vk_backend->fillBuffer(kv_v_buf[i], kv_size, 0);
     }
-    vk_backend->endAndSubmitCommandBuffer();
-    vk_backend->waitIdle();
 
     int hd = cfg.head_dim;
     int half = hd / 2;
@@ -283,52 +250,23 @@ void Inference::init(Model* m, VulkanBackend* vk) {
 
     cos_buf = vk_backend->createBuffer(cos_table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     sin_buf = vk_backend->createBuffer(sin_table.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    vk_backend->uploadToDeviceLocal(cos_buf, cos_table.data(), cos_table.size() * 4);
-    vk_backend->uploadToDeviceLocal(sin_buf, sin_table.data(), sin_table.size() * 4);
+    vk_backend->uploadData(cos_buf, cos_table.data(), cos_table.size() * 4);
+    vk_backend->uploadData(sin_buf, sin_table.data(), sin_table.size() * 4);
+
+    vk_backend->endAndSubmitCommandBuffer();
+    vk_backend->waitFence();
 }
 
-void Inference::forward(int token, int pos, float* logits) {
+
+void Inference::forward(int token, int pos) {
+    // beginCommandBuffer handles waitFence for the previous token.
+    // We record the entire forward pass into a single command buffer.
+    vk_backend->beginCommandBuffer();
+
     auto& cfg = model->cfg;
     int hd = cfg.head_dim;
     int half = hd / 2;
     int n_embd = cfg.n_embd;
-
-    // Helper macro to dump Vulkan buffer to file for debugging
-    #define VK_DUMP_BUF(buf, size, name) \
-        do { \
-            vk_backend->endAndSubmitCommandBuffer(); \
-            vk_backend->waitIdle(); \
-            std::vector<float> _tmp(size); \
-            vk_backend->copyFromBuffer(buf, _tmp.data(), size * 4); \
-            FILE* _f = fopen(name, "wb"); \
-            fwrite(_tmp.data(), sizeof(float), size, _f); \
-            fclose(_f); \
-            vk_backend->beginCommandBuffer(); \
-        } while(0)
-
-    // 1. Embedding lookup
-    std::vector<float> tmp_embd(n_embd);
-    if (model->token_embd->type == GT_F32) {
-        const float* emb = (const float*)model->token_embd->data + (size_t)token * n_embd;
-        std::copy(emb, emb + n_embd, tmp_embd.begin());
-    } else if (model->token_embd->type == GT_Q4_0) {
-        const block_q4_0* blk = (const block_q4_0*)model->token_embd->data;
-        int nblk = n_embd / 32;
-        const block_q4_0* b = blk + (size_t)token * nblk;
-        for (int i = 0; i < nblk; i++) {
-            float d = fp16_to_fp32(b[i].d);
-            for (int j = 0; j < 16; j++) {
-                tmp_embd[i*32 + j]      = d * ((b[i].qs[j] & 0xF) - 8);
-                tmp_embd[i*32 + j + 16] = d * ((b[i].qs[j] >> 4) - 8);
-            }
-        }
-    } else if (model->token_embd->type == GT_F16) {
-        const uint16_t* emb = (const uint16_t*)model->token_embd->data + (size_t)token * n_embd;
-        for (int i = 0; i < n_embd; i++) tmp_embd[i] = fp16_to_fp32(emb[i]);
-    }
-    vk_backend->copyToBuffer(h_buf, tmp_embd.data(), n_embd * 4);
-
-    vk_backend->beginCommandBuffer();
 
     auto get_matvec_shader = [&](const GGUFTensor* t, bool expert) -> VkShaderModule {
         if (!t) return expert ? matvec_q4_0_expert_shader : matvec_q4_0_shader;
@@ -347,154 +285,157 @@ void Inference::forward(int token, int pos, float* logits) {
     } attn_pc;
     struct ExpertPC { int M; int K; int has_bias; int expert_idx; int M_per_expert; } exp_pc;
     struct AddPC { int n; float weight; } add_pc;
+    struct MoeRouterPC { int n_experts; int top_k; } moe_router_pc;
+    struct AddMoePC { int n; int expert_idx; } add_moe_pc;
 
     for (int li = 0; li < cfg.n_layers; li++) {
         auto& L = model->layers[li];
         auto& VL = vk_layers[li];
 
-        // --- Attention Block ---
+        if (li == 0) {
+            // 1. Embedding lookup (GPU)
+            struct EmbedPC { int token_id; int n_embd; int type; } embed_pc;
+            embed_pc.token_id = token;
+            embed_pc.n_embd   = n_embd;
+            embed_pc.type     = (model->token_embd->type == GT_F32) ? 0 :
+                                (model->token_embd->type == GT_F16) ? 1 : 2;
+            vk_backend->dispatch(embed_lookup_shader, (n_embd + 31) / 32, 1, 1,
+                                 { token_embd_buf, h_buf },
+                                 &embed_pc, sizeof(EmbedPC));
+            vk_backend->barrier({ h_buf });
+        }
+
+        // --- Attention RMSNorm ---
         rms_pc.n = n_embd; rms_pc.eps = cfg.rms_eps;
-        vk_backend->dispatch(rmsnorm_shader, 1, 1, 1, 
+        vk_backend->dispatch(rmsnorm_shader, 1, 1, 1,
                              {h_buf, VL.attn_norm, normed_buf}, &rms_pc, sizeof(RmsNormPC));
+        vk_backend->barrier({normed_buf});
 
-        if (pos == 0 && li == 0) VK_DUMP_BUF(normed_buf, n_embd, "dump_vk_l0_step1_norm.bin");
-
+        // --- Q, K, V projections ---
         matvec_pc.K = n_embd; matvec_pc.has_bias = 1;
-        
-        matvec_pc.M = cfg.n_head * hd;
-        vk_backend->dispatch(get_matvec_shader(L.q, false), matvec_pc.M, 1, 1, 
-                             {VL.q, normed_buf, q_buf, VL.q_bias}, &matvec_pc, sizeof(MatVecPC));
-        
-        matvec_pc.M = cfg.n_head_kv * hd;
-        vk_backend->dispatch(get_matvec_shader(L.k, false), matvec_pc.M, 1, 1, 
-                             {VL.k, normed_buf, k_buf, VL.k_bias}, &matvec_pc, sizeof(MatVecPC));
-        vk_backend->dispatch(get_matvec_shader(L.v, false), matvec_pc.M, 1, 1, 
-                             {VL.v, normed_buf, v_buf, VL.v_bias}, &matvec_pc, sizeof(MatVecPC));
 
+        matvec_pc.M = cfg.n_head * hd;
+        vk_backend->dispatch(get_matvec_shader(L.q, false), matvec_pc.M, 1, 1,
+                             {VL.q, normed_buf, q_buf, VL.q_bias}, &matvec_pc, sizeof(MatVecPC));
+
+        matvec_pc.M = cfg.n_head_kv * hd;
+        vk_backend->dispatch(get_matvec_shader(L.k, false), matvec_pc.M, 1, 1,
+                             {VL.k, normed_buf, k_buf, VL.k_bias}, &matvec_pc, sizeof(MatVecPC));
+        vk_backend->dispatch(get_matvec_shader(L.v, false), matvec_pc.M, 1, 1,
+                             {VL.v, normed_buf, v_buf, VL.v_bias}, &matvec_pc, sizeof(MatVecPC));
+        vk_backend->barrier({q_buf, k_buf, v_buf});
+
+        // --- RoPE on Q and K ---
         rope_pc.head_dim = hd; rope_pc.pos = pos;
         rope_pc.n_head = cfg.n_head;
         vk_backend->dispatch(rope_shader, rope_pc.n_head, 1, 1, {q_buf, cos_buf, sin_buf}, &rope_pc, sizeof(RoPEPC));
         rope_pc.n_head = cfg.n_head_kv;
         vk_backend->dispatch(rope_shader, rope_pc.n_head, 1, 1, {k_buf, cos_buf, sin_buf}, &rope_pc, sizeof(RoPEPC));
+        vk_backend->barrier({q_buf, k_buf});
 
-        if (pos == 0 && li == 0) VK_DUMP_BUF(q_buf, cfg.n_head * hd, "dump_vk_l0_step2_qproj_rope.bin");
-
+        // --- Copy K, V into KV cache ---
         ckv_pc.pos = pos; ckv_pc.n_head_kv = cfg.n_head_kv; ckv_pc.head_dim = hd;
-        vk_backend->dispatch(copy_to_kv_shader, (cfg.n_head_kv * hd + 255)/256, 1, 1, 
+        vk_backend->dispatch(copy_to_kv_shader, (cfg.n_head_kv * hd + 255)/256, 1, 1,
                              {k_buf, kv_k_buf[li]}, &ckv_pc, sizeof(CopyKVPC));
-        vk_backend->dispatch(copy_to_kv_shader, (cfg.n_head_kv * hd + 255)/256, 1, 1, 
+        vk_backend->dispatch(copy_to_kv_shader, (cfg.n_head_kv * hd + 255)/256, 1, 1,
                              {v_buf, kv_v_buf[li]}, &ckv_pc, sizeof(CopyKVPC));
+        vk_backend->barrier({q_buf, kv_k_buf[li], kv_v_buf[li]});
 
-        attn_pc.n_head = cfg.n_head; attn_pc.n_head_kv = cfg.n_head_kv; 
+        // --- Attention ---
+        attn_pc.n_head = cfg.n_head; attn_pc.n_head_kv = cfg.n_head_kv;
         attn_pc.head_dim = hd; attn_pc.pos = pos;
         attn_pc.sliding_window = cfg.sliding_window; attn_pc.layer_idx = li;
         attn_pc.scale = cfg.q_pre_attn_scalar > 0.0f ? cfg.q_pre_attn_scalar : (1.0f / sqrtf((float)hd));
         attn_pc.attn_cap = cfg.attn_cap;
         vk_backend->dispatch(attention_shader, cfg.n_head, 1, 1,
-                             {q_buf, kv_k_buf[li], kv_v_buf[li], VL.attn_sinks, attn_out_buf}, 
+                             {q_buf, kv_k_buf[li], kv_v_buf[li], VL.attn_sinks, attn_out_buf},
                              &attn_pc, sizeof(AttnPC));
+        vk_backend->barrier({attn_out_buf});
 
-        if (pos == 0 && li == 0) VK_DUMP_BUF(attn_out_buf, cfg.n_head * hd, "dump_vk_l0_step3_attn.bin");
-
+        // --- Output projection ---
         matvec_pc.M = n_embd; matvec_pc.K = cfg.n_head * hd;
-        vk_backend->dispatch(get_matvec_shader(L.o, false), matvec_pc.M, 1, 1, 
+        vk_backend->dispatch(get_matvec_shader(L.o, false), matvec_pc.M, 1, 1,
                              {VL.o, attn_out_buf, tmp_buf, VL.o_bias}, &matvec_pc, sizeof(MatVecPC));
-        
+        vk_backend->barrier({tmp_buf});
+
+        // --- Residual add ---
         add_pc.n = n_embd; add_pc.weight = 1.0f;
         vk_backend->dispatch(add_shader, (n_embd + 255)/256, 1, 1, {h_buf, tmp_buf}, &add_pc, sizeof(AddPC));
+        vk_backend->barrier({h_buf});
 
-        if (pos == 0 && li == 0) VK_DUMP_BUF(h_buf, n_embd, "dump_vk_l0_step4_attn_residual.bin");
-
-        // --- FFN Block ---
+        // --- FFN RMSNorm ---
         rms_pc.n = n_embd;
-        vk_backend->dispatch(rmsnorm_shader, 1, 1, 1, 
+        vk_backend->dispatch(rmsnorm_shader, 1, 1, 1,
                              {h_buf, VL.post_attn_norm, normed_buf}, &rms_pc, sizeof(RmsNormPC));
+        vk_backend->barrier({normed_buf});
 
+        // --- Router ---
         matvec_pc.M = cfg.n_experts; matvec_pc.K = n_embd; matvec_pc.has_bias = 1;
-        vk_backend->dispatch(get_matvec_shader(L.ffn_gate_inp, false), matvec_pc.M, 1, 1, 
+        vk_backend->dispatch(get_matvec_shader(L.ffn_gate_inp, false), matvec_pc.M, 1, 1,
                              {VL.ffn_gate_inp, normed_buf, router_buf, VL.ffn_gate_inp_bias}, &matvec_pc, sizeof(MatVecPC));
+        vk_backend->barrier({router_buf});
 
-        vk_backend->endAndSubmitCommandBuffer();
-        vk_backend->waitIdle();
+        // --- MoE routing (softmax + top-k) ---
+        moe_router_pc.n_experts = cfg.n_experts;
+        moe_router_pc.top_k = cfg.n_experts_per_tok;
+        vk_backend->dispatch(moe_router_shader, 1, 1, 1,
+                             {router_buf, moe_weights_buf}, &moe_router_pc, sizeof(MoeRouterPC));
+        vk_backend->barrier({moe_weights_buf});
 
-        // --- CPU MoE Top-K Selection ---
-        // Pre-allocate to avoid per-layer heap allocations
-        int topk = cfg.n_experts_per_tok;
-        static thread_local std::vector<int> idx;
-        static thread_local std::vector<float> wts;
-        if ((int)idx.size() != cfg.n_experts) idx.resize(cfg.n_experts);
-        if ((int)wts.size() != topk) wts.resize(topk);
-
-        float router_logits[16];
-        vk_backend->copyFromBuffer(router_buf, router_logits, cfg.n_experts * 4);
-
-        for (int i = 0; i < cfg.n_experts; i++) idx[i] = i;
-        std::partial_sort(idx.begin(), idx.begin() + topk, idx.end(),
-            [&](int a, int b){ return router_logits[a] > router_logits[b]; });
-
-        float rmx = router_logits[idx[0]];
-        for (int i = 1; i < topk; i++) rmx = std::max(rmx, router_logits[idx[i]]);
-        float rsum = 0;
-        for (int i = 0; i < topk; i++) {
-            wts[i] = expf(router_logits[idx[i]] - rmx);
-            rsum += wts[i];
-        }
-        for (int i = 0; i < topk; i++) wts[i] /= rsum;
-
-        if (pos == 0 && li == 0) {
-            printf("[VK DBG] L0 Router Logits: ");
-            for(int i = 0; i < cfg.n_experts; i++) printf("%f ", router_logits[i]);
-            printf("\n[VK DBG] L0 TopK Idx: %d %d | Wts: %f %f\n", idx[0], idx[1], wts[0], wts[1]);
-        }
-
-        // Re-begin command buffer and natively zero the accumulation buf on GPU
-        vk_backend->beginCommandBuffer();
+        // --- Zero accumulator ---
         vk_backend->fillBuffer(down_out_buf, n_embd * 4, 0);
+        vk_backend->barrier({down_out_buf});
 
+        // --- Expert loop (dispatch ALL experts, no readback required) ---
         exp_pc.K = n_embd; exp_pc.has_bias = 1; exp_pc.M_per_expert = cfg.n_ff;
 
-        for (int i = 0; i < topk; i++) {
-            int e = idx[i];
-
+        for (int e = 0; e < cfg.n_experts; e++) {
+            // Gate + Up
             exp_pc.M = cfg.n_ff; exp_pc.expert_idx = e;
-            vk_backend->dispatch(get_matvec_shader(L.gate_exps, true), exp_pc.M, 1, 1, 
+            vk_backend->dispatch(get_matvec_shader(L.gate_exps, true), exp_pc.M, 1, 1,
                                  {VL.gate_exps, normed_buf, gate_out_buf, VL.gate_exps_bias}, &exp_pc, sizeof(ExpertPC));
-            
-            vk_backend->dispatch(get_matvec_shader(L.up_exps, true), exp_pc.M, 1, 1, 
+            vk_backend->dispatch(get_matvec_shader(L.up_exps, true), exp_pc.M, 1, 1,
                                  {VL.up_exps, normed_buf, up_out_buf, VL.up_exps_bias}, &exp_pc, sizeof(ExpertPC));
+            vk_backend->barrier({gate_out_buf, up_out_buf});
 
+            // SwiGLU
             int n_ff = cfg.n_ff;
             vk_backend->dispatch(swiglu_shader, (n_ff + 255)/256, 1, 1, {gate_out_buf, up_out_buf}, &n_ff, sizeof(int));
+            vk_backend->barrier({gate_out_buf});
 
-            if (pos == 0 && li == 0 && i == 0) {
-                VK_DUMP_BUF(gate_out_buf, cfg.n_ff, "dump_vk_l0_step5_swiglu.bin");
-            }
-
+            // Down projection
             exp_pc.M = n_embd;
             exp_pc.K = cfg.n_ff;
             exp_pc.M_per_expert = n_embd;
-            vk_backend->dispatch(get_matvec_shader(L.down_exps, true), exp_pc.M, 1, 1, 
+            vk_backend->dispatch(get_matvec_shader(L.down_exps, true), exp_pc.M, 1, 1,
                                  {VL.down_exps, gate_out_buf, tmp_buf, VL.down_exps_bias}, &exp_pc, sizeof(ExpertPC));
-            
-            exp_pc.K = n_embd; 
-            exp_pc.M_per_expert = cfg.n_ff;
-            
-            add_pc.n = n_embd; add_pc.weight = wts[i];
-            vk_backend->dispatch(add_shader, (n_embd + 255)/256, 1, 1, {down_out_buf, tmp_buf}, &add_pc, sizeof(AddPC));
+            vk_backend->barrier({tmp_buf});
+
+            // Accumulate into down_out_buf (add_moe reads moe_weights_buf, non-active are 0.0)
+            add_moe_pc.n = n_embd; add_moe_pc.expert_idx = e;
+            vk_backend->dispatch(add_moe_shader, (n_embd + 255)/256, 1, 1,
+                                 {down_out_buf, tmp_buf, moe_weights_buf}, &add_moe_pc, sizeof(AddMoePC));
+
+            // WAW barrier so the next expert can safely overwrite gate/up/tmp/down_out
+            if (e < cfg.n_experts - 1) {
+                vk_backend->barrier({gate_out_buf, up_out_buf, tmp_buf, down_out_buf});
+            }
         }
 
-        if (pos == 0 && li == 0) VK_DUMP_BUF(down_out_buf, n_embd, "dump_vk_l0_step6_ffn_out.bin");
-
+        // --- Final residual add ---
+        vk_backend->barrier({down_out_buf, normed_buf}); // normed_buf barrier for WAR safety on next layer
         add_pc.n = n_embd; add_pc.weight = 1.0f;
         vk_backend->dispatch(add_shader, (n_embd + 255)/256, 1, 1, {h_buf, down_out_buf}, &add_pc, sizeof(AddPC));
-
-        if (pos == 0 && li == 0) VK_DUMP_BUF(h_buf, n_embd, "dump_vk_l0_step7_ffn_residual.bin");
+        vk_backend->barrier({h_buf});
     }
 
-    // Final Norm & Output Projection
+    // ================================================================
+    // Final norm + output projection
+    // ================================================================
     rms_pc.n = cfg.n_embd; rms_pc.eps = cfg.rms_eps;
-    vk_backend->dispatch(rmsnorm_shader, 1, 1, 1, 
+    vk_backend->dispatch(rmsnorm_shader, 1, 1, 1,
                          {h_buf, output_norm_buf, normed_buf}, &rms_pc, sizeof(RmsNormPC));
+    vk_backend->barrier({normed_buf});
 
     matvec_pc.M = cfg.vocab_size; matvec_pc.K = cfg.n_embd; matvec_pc.has_bias = 0;
     const GGUFTensor* out_tensor = model->output ? model->output : model->token_embd;
@@ -503,17 +444,38 @@ void Inference::forward(int token, int pos, float* logits) {
         if (out_tensor->type == GT_F32) out_shader = matvec_f32_shader;
         else if (out_tensor->type == GT_F16) out_shader = matvec_f16_shader;
     }
-    vk_backend->dispatch(out_shader, matvec_pc.M, 1, 1, 
+    vk_backend->dispatch(out_shader, matvec_pc.M, 1, 1,
                          {output_buf, normed_buf, logits_buf, VK_NULL_HANDLE}, &matvec_pc, sizeof(MatVecPC));
 
-    vk_backend->endAndSubmitCommandBuffer();
-    vk_backend->waitIdle();
-
-    vk_backend->copyFromBuffer(logits_buf, logits, cfg.vocab_size * 4);
-
+    // Apply final tanh cap on the GPU (if enabled)
     if (cfg.final_cap > 0.0f) {
-        for (int i = 0; i < cfg.vocab_size; i++) {
-            logits[i] = tanhf(logits[i] / cfg.final_cap) * cfg.final_cap;
-        }
+        vk_backend->barrier({ logits_buf });
+        struct TanhCapPC { int n; float cap; } tc_pc;
+        tc_pc.n   = cfg.vocab_size;
+        tc_pc.cap = cfg.final_cap;
+        vk_backend->dispatch(tanh_cap_shader,
+                             (cfg.vocab_size + 255) / 256, 1, 1,
+                             { logits_buf },
+                             &tc_pc, sizeof(TanhCapPC));
     }
+
+    // Double-buffered readback: copy logits to alternating offsets in the 4MB readback buffer
+    vk_backend->barrier({logits_buf});
+    VkDeviceSize logits_offset = readback_flip ? 0 : 1048576; // 1MB offset
+    vk_backend->readbackData(logits_buf, logits_offset, cfg.vocab_size * 4);
+
+    // Submit the entire token at once
+    vk_backend->endAndSubmitCommandBuffer();
+}
+
+void Inference::get_logits(float* logits) {
+    auto& cfg = model->cfg;
+    
+    vk_backend->waitFence();
+    
+    VkDeviceSize logits_offset = readback_flip ? 0 : 1048576;
+    void* ptr = (uint8_t*)vk_backend->getReadbackPtr() + logits_offset;
+    memcpy(logits, ptr, cfg.vocab_size * 4);
+
+    readback_flip = 1 - readback_flip;
 }

@@ -68,6 +68,8 @@ struct Inference {
     VkBuffer gate_out_buf, up_out_buf, down_out_buf, router_buf;
     VkBuffer token_embd_buf, output_norm_buf, output_buf;
     VkBuffer cos_buf, sin_buf;
+    VkShaderModule moe_router_shader, add_moe_shader;
+    VkBuffer moe_weights_buf;
     std::vector<VkBuffer> kv_k_buf, kv_v_buf;
 
     struct VulkanLayerTensors {
@@ -82,7 +84,11 @@ struct Inference {
     VkShaderModule rmsnorm_shader, matvec_f32_shader, matvec_f16_shader, matvec_q4_0_shader;
     VkShaderModule matvec_f32_expert_shader, matvec_f16_expert_shader, matvec_q4_0_expert_shader;
     VkShaderModule rope_shader, copy_to_kv_shader, attention_shader, swiglu_shader, add_shader;
+    VkShaderModule embed_lookup_shader, tanh_cap_shader;
+
+    int readback_flip = 0; // Tracks double-buffered logits readback offset
 
     void init(Model* m, VulkanBackend* vk);
-    void forward(int token, int pos, float* logits);
+    void forward(int token, int pos);           // submits work, no readback
+    void get_logits(float* logits);             // waits for fence and reads back
 };

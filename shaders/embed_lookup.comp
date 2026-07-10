@@ -1,0 +1,52 @@
+#version 450
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer EmbdBuf { uint embd[]; };
+layout(set = 0, binding = 1) writeonly buffer OutBuf  { float out_data[]; };
+
+layout(push_constant) uniform PC {
+    int token_id;   // which row of the embedding table
+    int n_embd;     // row length (in floats)
+    int type;       // 0=F32, 1=F16, 2=Q4_0
+} pc;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);          // block index (32 elements per block)
+    int blk_start = i * 32;
+    if (blk_start >= pc.n_embd) return;
+
+    if (pc.type == 0) {                             // ---- F32 ----
+        int row_off = pc.token_id * pc.n_embd;
+        for (int j = 0; j < 32 && (blk_start + j) < pc.n_embd; j++) {
+            int byte_off = (row_off + blk_start + j) * 4;
+            uint word = embd[byte_off / 4];
+            uint bits = (word >> ((byte_off % 4) * 8)) & 0xFFFFFFFFu;
+            out_data[blk_start + j] = uintBitsToFloat(bits);
+        }
+    } else if (pc.type == 1) {                      // ---- F16 ----
+        int row_off = pc.token_id * pc.n_embd;
+        for (int j = 0; j < 32 && (blk_start + j) < pc.n_embd; j++) {
+            int byte_off = (row_off + blk_start + j) * 2;
+            uint word = embd[byte_off / 4];
+            uint h    = (word >> ((byte_off % 4) * 8)) & 0xFFFFu;
+            out_data[blk_start + j] = unpackHalf2x16(h).x;
+        }
+    } else {                                        // ---- Q4_0 ----
+        int nblk    = pc.n_embd / 32;
+        int blk_off = pc.token_id * nblk * 18 + i * 18;   // 18 bytes per q4_0 block
+
+        uint word0  = embd[blk_off / 4];
+        uint d_raw  = (word0 >> ((blk_off % 4) * 8)) & 0xFFFFu;
+        float d     = unpackHalf2x16(d_raw).x;
+
+        for (int j = 0; j < 16; j++) {
+            int q_byte_off = blk_off + 2 + j;
+            uint word1 = embd[q_byte_off / 4];
+            uint q_val = (word1 >> ((q_byte_off % 4) * 8)) & 0xFFu;
+            int q0 = int(q_val & 0x0F) - 8;
+            int q1 = int(q_val >> 4)    - 8;
+            out_data[blk_start + j]      = d * float(q0);
+            out_data[blk_start + j + 16] = d * float(q1);
+        }
+    }
+}

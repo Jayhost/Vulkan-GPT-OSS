@@ -12,8 +12,8 @@
 
 struct SamplerArgs {
     float temp = 1.0f;
-    int top_k = 0;       // 0 = disabled
-    float top_p = 1.0f;  // 1.0 = disabled
+    int top_k = 0;       
+    float top_p = 1.0f;  
     float repeat_penalty = 1.0f;
 };
 
@@ -113,7 +113,6 @@ int main(int argc, char** argv) {
 
     Inference infer;
 
-    // Helper to load SPIR-V shaders from disk
     auto loadShader = [&](const char* path) -> VkShaderModule {
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f.is_open()) {
@@ -140,6 +139,10 @@ int main(int argc, char** argv) {
     infer.attention_shader = loadShader("shaders/attention.spv");
     infer.swiglu_shader = loadShader("shaders/swiglu.spv");
     infer.add_shader = loadShader("shaders/add.spv");
+    infer.moe_router_shader = loadShader("shaders/moe_router.spv");
+    infer.add_moe_shader = loadShader("shaders/add_moe.spv");
+    infer.embed_lookup_shader = loadShader("shaders/embed_lookup.spv");
+    infer.tanh_cap_shader     = loadShader("shaders/tanh_cap.spv");
 
     infer.init(&model, &vk);
 
@@ -153,38 +156,43 @@ int main(int argc, char** argv) {
 
     std::vector<float> logits(model.cfg.vocab_size);
 
+    // --- Prefill Loop ---
+    // We don't need logits for intermediate prefill steps. Submit everything
+    // back-to-back without blocking the CPU. waitFence() in forward() ensures
+    // we don't overwrite scratch buffers still in use by the GPU.
     auto t0 = std::chrono::steady_clock::now();
     int pos = 0;
     for (int t : tokens) {
-        infer.forward(t, pos, logits.data());
+        infer.forward(t, pos);
         pos++;
     }
+    // Wait for the very last prefill token to finish so we can read logits
+    infer.get_logits(logits.data());
+
     auto t1 = std::chrono::steady_clock::now();
     double prefill_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     printf("Prefill: %d tokens in %.0f ms (%.1f tok/s)\n",
            (int)tokens.size(), prefill_ms, tokens.size() / (prefill_ms/1000));
 
-    // --- DEBUG DUMP ---
-    FILE* f = fopen("logits_cpp.bin", "wb");
-    if (f) {
-        fwrite(logits.data(), sizeof(float), model.cfg.vocab_size, f);
-        fclose(f);
-        printf("Dumped %d logits to logits_cpp.bin\n", model.cfg.vocab_size);
-    }
-    // ------------------
-
     printf("\n--- Output ---\n");
     std::vector<int> generated;
     std::vector<int> recent;
 
-    for (int i = 0; i < max_tokens; i++) {
-        int next = sample(logits.data(), model.cfg.vocab_size, sa, recent, rng_next());
+    // Sample first generated token immediately from prefill output
+    int next = sample(logits.data(), model.cfg.vocab_size, sa, recent, rng_next());
 
+    // --- Generation Loop ---
+    for (int i = 0; i < max_tokens; i++) {
         if (next == model.cfg.eos_id) {
             printf("<EOS>\n");
             break;
         }
 
+        // 1. Submit forward pass for the token. GPU starts working immediately.
+        infer.forward(next, pos);
+        pos++;
+
+        // 2. Overlap CPU side string decode/print with GPU execution
         std::string piece = tok.decode({next});
         printf("%s", piece.c_str());
         fflush(stdout);
@@ -193,8 +201,9 @@ int main(int argc, char** argv) {
         recent.push_back(next);
         if (recent.size() > 64) recent.erase(recent.begin());
 
-        infer.forward(next, pos, logits.data());
-        pos++;
+        // 3. Block only now that we actually need the logits to sample the next token
+        infer.get_logits(logits.data());
+        next = sample(logits.data(), model.cfg.vocab_size, sa, recent, rng_next());
     }
     printf("\n");
 
@@ -203,7 +212,7 @@ int main(int argc, char** argv) {
     printf("\nGeneration: %d tokens in %.0f ms (%.1f tok/s)\n",
            (int)generated.size(), gen_ms, generated.size() / (gen_ms/1000));
 
-        // Cleanup shaders to prevent ASAN memory leaks
+    // Cleanup shaders to prevent ASAN memory leaks
     vk.destroyShader(infer.rmsnorm_shader);
     vk.destroyShader(infer.matvec_f32_shader);
     vk.destroyShader(infer.matvec_f16_shader);
@@ -216,7 +225,11 @@ int main(int argc, char** argv) {
     vk.destroyShader(infer.attention_shader);
     vk.destroyShader(infer.swiglu_shader);
     vk.destroyShader(infer.add_shader);
+    vk.destroyShader(infer.moe_router_shader);
+    vk.destroyShader(infer.add_moe_shader);
+    vk.destroyShader(infer.embed_lookup_shader);
+vk.destroyShader(infer.tanh_cap_shader);
 
     vk.cleanup();
     return 0;
-}       
+}

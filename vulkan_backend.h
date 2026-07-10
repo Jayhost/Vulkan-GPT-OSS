@@ -10,13 +10,11 @@ public:
     void cleanup();
 
     VkBuffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props);
-    void copyToBuffer(VkBuffer buffer, const void* data, VkDeviceSize size);
-    void copyFromBuffer(VkBuffer buffer, void* data, VkDeviceSize size);
+    void uploadData(VkBuffer dst, const void* data, VkDeviceSize size);
+    void readbackData(VkBuffer src, VkDeviceSize dst_offset, VkDeviceSize size);
+    void* getReadbackPtr() const { return readbackMapped_; }
     
-    // New: Fast GPU-side buffer zeroing
     void fillBuffer(VkBuffer buffer, VkDeviceSize size, uint32_t data);
-    // New: Upload to VRAM using a staging buffer
-    void uploadToDeviceLocal(VkBuffer dst, const void* data, VkDeviceSize size);
 
     VkShaderModule createShader(const std::vector<uint32_t>& spirv);
     void destroyShader(VkShaderModule shader) { if (shader) vkDestroyShaderModule(device_, shader, nullptr); }
@@ -24,7 +22,10 @@ public:
     void beginCommandBuffer();
     void dispatch(VkShaderModule shader, uint32_t groupX, uint32_t groupY, uint32_t groupZ,
                   const std::vector<VkBuffer>& bindings, const void* pushConstData, size_t pushConstSize);
+    void barrier(const std::vector<VkBuffer>& bufs);
     void endAndSubmitCommandBuffer();
+    
+    void waitFence();
     void waitIdle();
 
     VkDevice device() const { return device_; }
@@ -40,10 +41,22 @@ private:
     VkDescriptorPool descPool_;
     VkDescriptorSetLayout descSetLayout_;
     VkPipelineLayout pipelineLayout_;
+    VkFence fence_;
 
     std::unordered_map<VkBuffer, VkDeviceMemory> bufferMemMap_;
     std::vector<VkPipeline> pendingPipelines_;
     std::vector<VkDescriptorSet> pendingDescSets_;
-    // New: Pipeline cache
     std::unordered_map<VkShaderModule, VkPipeline> pipelineCache_;
+
+    // Staging ring buffer for host-to-device transfers
+    VkBuffer stagingBuffer_;
+    VkDeviceMemory stagingMem_;
+    void* stagingMapped_ = nullptr;
+    VkDeviceSize stagingSize_ = 16 * 1024 * 1024; // 16 MB
+    VkDeviceSize stagingOffset_ = 0;
+
+    // Readback buffer for device-to-host transfers
+    VkBuffer readbackBuffer_;
+    VkDeviceMemory readbackMem_;
+    void* readbackMapped_ = nullptr;
 };

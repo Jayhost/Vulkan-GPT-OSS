@@ -1,0 +1,42 @@
+#version 450
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0) buffer RouterLogits { float logits[]; };
+layout(set = 0, binding = 1) buffer WeightsOut { float weights[]; };
+
+layout(push_constant) uniform PC {
+    int n_experts;
+    int top_k;
+} pc;
+
+void main() {
+    float max_val = -1e30;
+    for (int i = 0; i < pc.n_experts; i++) {
+        max_val = max(max_val, logits[i]);
+    }
+    
+    bool is_top[8]; // Assumes max 8 experts
+    for (int i = 0; i < pc.n_experts; i++) is_top[i] = false;
+    
+    float sum_exp = 0.0;
+    for (int k = 0; k < pc.top_k; k++) {
+        float cur_max = -1e30;
+        int cur_idx = -1;
+        for (int i = 0; i < pc.n_experts; i++) {
+            if (!is_top[i] && logits[i] > cur_max) {
+                cur_max = logits[i];
+                cur_idx = i;
+            }
+        }
+        is_top[cur_idx] = true;
+        sum_exp += exp(cur_max - max_val);
+    }
+    
+    for (int i = 0; i < pc.n_experts; i++) {
+        if (is_top[i]) {
+            weights[i] = exp(logits[i] - max_val) / sum_exp;
+        } else {
+            weights[i] = 0.0;
+        }
+    }
+}

@@ -2,6 +2,7 @@
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
+#include <algorithm>
 
 uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeFilter, VkMemoryPropertyFlags props) {
     VkPhysicalDeviceMemoryProperties memProps;
@@ -16,25 +17,6 @@ uint32_t findMemoryType(VkPhysicalDevice phys, uint32_t typeFilter, VkMemoryProp
 
 void VulkanBackend::fillBuffer(VkBuffer buffer, VkDeviceSize size, uint32_t data) {
     vkCmdFillBuffer(commandBuffer_, buffer, 0, size, data);
-}
-
-void VulkanBackend::uploadToDeviceLocal(VkBuffer dst, const void* data, VkDeviceSize size) {
-    // Create temporary staging buffer in System RAM
-    VkBuffer staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 
-                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    copyToBuffer(staging, data, size);
-    
-    // Copy from System RAM to VRAM
-    beginCommandBuffer();
-    VkBufferCopy region{0, 0, size};
-    vkCmdCopyBuffer(commandBuffer_, staging, dst, 1, &region);
-    endAndSubmitCommandBuffer();
-    waitIdle(); // Wait for copy to finish
-    
-    // Free staging buffer
-    vkDestroyBuffer(device_, staging, nullptr);
-    vkFreeMemory(device_, bufferMemMap_[staging], nullptr);
-    bufferMemMap_.erase(staging);
 }
 
 void VulkanBackend::init() {
@@ -86,10 +68,10 @@ void VulkanBackend::init() {
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     vkAllocateCommandBuffers(device_, &cbai, &commandBuffer_);
 
-    VkDescriptorPoolSize poolSizes[] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000 } };
+    VkDescriptorPoolSize poolSizes[] = { { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 100000 } };
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpci.maxSets = 1000;
+    dpci.maxSets = 10000;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = poolSizes;
     vkCreateDescriptorPool(device_, &dpci, nullptr, &descPool_);
@@ -100,7 +82,6 @@ void VulkanBackend::init() {
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        bindings[i].pImmutableSamplers = nullptr;
     }
     VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslci.bindingCount = 8;
@@ -118,10 +99,30 @@ void VulkanBackend::init() {
     plci.pPushConstantRanges = &pcr;
     vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout_);
 
-    // FIX: Allocate large enough dummy buffer (e.g. 4096 bytes for up to 1024 heads) and fully zero it
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (vkCreateFence(device_, &fci, nullptr, &fence_) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create fence");
+    }
+
     dummy_buf = createBuffer(4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
-    std::vector<uint8_t> zero(4096, 0);
-    copyToBuffer(dummy_buf, zero.data(), 4096);
+    void* mapped_dummy;
+    vkMapMemory(device_, bufferMemMap_[dummy_buf], 0, 4096, 0, &mapped_dummy);
+    memset(mapped_dummy, 0, 4096);
+    vkUnmapMemory(device_, bufferMemMap_[dummy_buf]);
+
+    // Persistently mapped Staging Buffer
+    stagingBuffer_ = createBuffer(stagingSize_, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    stagingMem_ = bufferMemMap_[stagingBuffer_];
+    vkMapMemory(device_, stagingMem_, 0, stagingSize_, 0, &stagingMapped_);
+
+    // Persistently mapped Readback Buffer (4 MB, enough for 2x 128k vocab floats)
+    VkDeviceSize rbSize = 4 * 1024 * 1024;
+    readbackBuffer_ = createBuffer(rbSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    readbackMem_ = bufferMemMap_[readbackBuffer_];
+    vkMapMemory(device_, readbackMem_, 0, rbSize, 0, &readbackMapped_);
 }       
 
 VkBuffer VulkanBackend::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props) {
@@ -151,18 +152,31 @@ VkBuffer VulkanBackend::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage
     return buf;
 }
 
-void VulkanBackend::copyToBuffer(VkBuffer buffer, const void* data, VkDeviceSize size) {
-    void* mapped;
-    vkMapMemory(device_, bufferMemMap_[buffer], 0, size, 0, &mapped);
-    memcpy(mapped, data, (size_t)size);
-    vkUnmapMemory(device_, bufferMemMap_[buffer]);
+void VulkanBackend::uploadData(VkBuffer dst, const void* data, VkDeviceSize size) {
+    VkDeviceSize offset = 0;
+    while (offset < size) {
+        stagingOffset_ = (stagingOffset_ + 255) & ~255; // Align to 256 bytes
+        if (stagingOffset_ + size > stagingSize_) {
+            endAndSubmitCommandBuffer();
+            waitFence();
+            beginCommandBuffer();
+            stagingOffset_ = (stagingOffset_ + 255) & ~255;
+        }
+        
+        VkDeviceSize chunk = std::min(size - offset, stagingSize_ - stagingOffset_);
+        memcpy((uint8_t*)stagingMapped_ + stagingOffset_, (const uint8_t*)data + offset, chunk);
+        
+        VkBufferCopy region{stagingOffset_, offset, chunk};
+        vkCmdCopyBuffer(commandBuffer_, stagingBuffer_, dst, 1, &region);
+        
+        stagingOffset_ += chunk;
+        offset += chunk;
+    }
 }
 
-void VulkanBackend::copyFromBuffer(VkBuffer buffer, void* data, VkDeviceSize size) {
-    void* mapped;
-    vkMapMemory(device_, bufferMemMap_[buffer], 0, size, 0, &mapped);
-    memcpy(data, mapped, (size_t)size);
-    vkUnmapMemory(device_, bufferMemMap_[buffer]);
+void VulkanBackend::readbackData(VkBuffer src, VkDeviceSize dst_offset, VkDeviceSize size) {
+    VkBufferCopy region{0, dst_offset, size};
+    vkCmdCopyBuffer(commandBuffer_, src, readbackBuffer_, 1, &region);
 }
 
 VkShaderModule VulkanBackend::createShader(const std::vector<uint32_t>& spirv) {
@@ -175,15 +189,45 @@ VkShaderModule VulkanBackend::createShader(const std::vector<uint32_t>& spirv) {
 }
 
 void VulkanBackend::beginCommandBuffer() {
+    waitFence();
+    vkResetFences(device_, 1, &fence_);
     vkResetCommandBuffer(commandBuffer_, 0);
     VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(commandBuffer_, &cbbi);
+    stagingOffset_ = 0; // Safe to reset since GPU is idle
+}
+
+void VulkanBackend::barrier(const std::vector<VkBuffer>& bufs) {
+    if (bufs.empty()) return;
+
+    std::vector<VkBufferMemoryBarrier> bmb;
+    bmb.reserve(bufs.size());
+    for (VkBuffer b : bufs) {
+        if (b == VK_NULL_HANDLE) continue;
+        VkBufferMemoryBarrier bar{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bar.buffer = b;
+        bar.offset = 0;
+        bar.size = VK_WHOLE_SIZE;
+        bmb.push_back(bar);
+    }
+    if (bmb.empty()) return;
+
+    vkCmdPipelineBarrier(commandBuffer_,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr,
+        (uint32_t)bmb.size(), bmb.data(),
+        0, nullptr);
 }
 
 void VulkanBackend::dispatch(VkShaderModule shader, uint32_t groupX, uint32_t groupY, uint32_t groupZ,
                              const std::vector<VkBuffer>& bindings, const void* pushConstData, size_t pushConstSize) {
-    // 1. Fetch or Create Pipeline
     VkPipeline pipeline;
     auto it = pipelineCache_.find(shader);
     if (it != pipelineCache_.end()) {
@@ -196,14 +240,12 @@ void VulkanBackend::dispatch(VkShaderModule shader, uint32_t groupX, uint32_t gr
         pci.stage.module = shader;
         pci.stage.pName = "main";
         pci.layout = pipelineLayout_;
-        
         if (vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create compute pipeline");
         }
         pipelineCache_[shader] = pipeline;
     }
 
-    // 2. Allocate Descriptor Set
     VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     dsai.descriptorPool = descPool_;
     dsai.descriptorSetCount = 1;
@@ -213,24 +255,20 @@ void VulkanBackend::dispatch(VkShaderModule shader, uint32_t groupX, uint32_t gr
         throw std::runtime_error("Failed to allocate descriptor set");
     }
 
-    std::vector<VkDescriptorBufferInfo> bufInfos;
-    std::vector<VkWriteDescriptorSet> writes;
-    bufInfos.reserve(bindings.size());
-    writes.reserve(bindings.size());
-    
-    for (size_t i = 0; i < bindings.size(); i++) {
-        VkBuffer buf = (bindings[i] != VK_NULL_HANDLE) ? bindings[i] : dummy_buf;
-        bufInfos.push_back({buf, 0, VK_WHOLE_SIZE});
-        writes.push_back({VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET});
-        writes.back().dstSet = descSet;
-        writes.back().dstBinding = i;
-        writes.back().descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes.back().descriptorCount = 1;
-        writes.back().pBufferInfo = &bufInfos.back();
+    VkDescriptorBufferInfo bufInfos[8];
+    VkWriteDescriptorSet writes[8];
+    for (size_t i = 0; i < 8; i++) {
+        VkBuffer buf = (i < bindings.size() && bindings[i] != VK_NULL_HANDLE) ? bindings[i] : dummy_buf;
+        bufInfos[i] = {buf, 0, VK_WHOLE_SIZE};
+        writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[i].dstSet = descSet;
+        writes[i].dstBinding = i;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].descriptorCount = 1;
+        writes[i].pBufferInfo = &bufInfos[i];
     }
-    vkUpdateDescriptorSets(device_, writes.size(), writes.data(), 0, nullptr);
+    vkUpdateDescriptorSets(device_, 8, writes, 0, nullptr);
 
-    // 3. Record commands
     vkCmdBindPipeline(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout_, 0, 1, &descSet, 0, nullptr);
     if (pushConstData && pushConstSize > 0) {
@@ -238,39 +276,37 @@ void VulkanBackend::dispatch(VkShaderModule shader, uint32_t groupX, uint32_t gr
     }
     vkCmdDispatch(commandBuffer_, groupX, groupY, groupZ);
 
-    // 4. Memory Barrier
-    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(commandBuffer_,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &barrier, 0, nullptr, 0, nullptr);
-
-    pendingDescSets_.push_back(descSet); // Pipelines no longer pushed, they are cached!
+    pendingDescSets_.push_back(descSet);
 }
-
 
 void VulkanBackend::endAndSubmitCommandBuffer() {
     vkEndCommandBuffer(commandBuffer_);
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &commandBuffer_;
-    vkQueueSubmit(computeQueue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueSubmit(computeQueue_, 1, &si, fence_);
 }
 
-void VulkanBackend::waitIdle() {
-    vkQueueWaitIdle(computeQueue_);
+void VulkanBackend::waitFence() {
+    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
     for (auto p : pendingPipelines_) vkDestroyPipeline(device_, p, nullptr);
     for (auto d : pendingDescSets_) vkFreeDescriptorSets(device_, descPool_, 1, &d);
     pendingPipelines_.clear();
     pendingDescSets_.clear();
 }
 
+void VulkanBackend::waitIdle() {
+    waitFence();
+}
+
 void VulkanBackend::cleanup() {
     waitIdle();
-    for (auto& pair : pipelineCache_) {
-        vkDestroyPipeline(device_, pair.second, nullptr);
-    }
+    
+    if (stagingMapped_) vkUnmapMemory(device_, stagingMem_);
+    if (readbackMapped_) vkUnmapMemory(device_, readbackMem_);
+
+    if (fence_) vkDestroyFence(device_, fence_, nullptr);
+    for (auto& pair : pipelineCache_) vkDestroyPipeline(device_, pair.second, nullptr);
     for (auto& pair : bufferMemMap_) {
         vkDestroyBuffer(device_, pair.first, nullptr);
         vkFreeMemory(device_, pair.second, nullptr);
